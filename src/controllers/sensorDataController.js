@@ -17,7 +17,7 @@ const uploadSensorData = async (req, res, next) => {
       return res.status(404).json({ message: '养殖池不存在' });
     }
     
-    const status = evaluateSensorStatus(sensorType, value, pond.thresholds);
+    const statusResult = evaluateSensorStatus(sensorType, value, pond.thresholds);
     
     const sensorData = new SensorData({
       pond: pondId,
@@ -25,7 +25,7 @@ const uploadSensorData = async (req, res, next) => {
       sensorType,
       value,
       unit: unit || getDefaultUnit(sensorType),
-      status,
+      status: statusResult.status,
       timestamp: timestamp || Date.now()
     });
     
@@ -33,16 +33,33 @@ const uploadSensorData = async (req, res, next) => {
     
     await updatePondCurrentWaterQuality(pondId, sensorType, value);
     
-    if (status === 'warning' || status === 'critical') {
-      await checkAndGenerateAlert(pondId, sensorType, value, status);
+    if (statusResult.status === 'warning' || statusResult.status === 'critical') {
+      await checkAndGenerateAlert(
+        pondId, 
+        sensorType, 
+        value, 
+        statusResult.status,
+        statusResult.level,
+        statusResult.direction,
+        statusResult.threshold,
+        statusResult.deviation
+      );
     }
     
     autoControlDevices(pondId, { [sensorType]: value });
     
+    const statusTextMap = {
+      'normal': '',
+      'warning': `${statusResult.level === 'low' ? '低' : '中'}级警告`,
+      'critical': `${statusResult.level === 'high' ? '高' : '严重'}级预警`
+    };
+    
     res.status(201).json({
       success: true,
       data: sensorData,
-      message: status !== 'normal' ? `水质${status === 'warning' ? '警告' : '严重'}，已生成预警` : '数据上传成功'
+      message: statusResult.status !== 'normal' 
+        ? `水质异常：${statusTextMap[statusResult.status]}，${statusResult.direction === 'below_threshold' ? '低于' : '超过'}阈值${statusResult.threshold}，偏离${statusResult.deviation}%` 
+        : '数据上传成功'
     });
   } catch (error) {
     next(error);
@@ -70,7 +87,7 @@ const batchUploadSensorData = async (req, res, next) => {
       
       if (!sensorId || !sensorType || value === undefined) continue;
       
-      const status = evaluateSensorStatus(sensorType, value, pond.thresholds);
+      const statusResult = evaluateSensorStatus(sensorType, value, pond.thresholds);
       
       const sensorData = new SensorData({
         pond: pondId,
@@ -78,14 +95,22 @@ const batchUploadSensorData = async (req, res, next) => {
         sensorType,
         value,
         unit: unit || getDefaultUnit(sensorType),
-        status,
+        status: statusResult.status,
         timestamp: timestamp || Date.now()
       });
       
       sensorDataList.push(sensorData);
       
-      if (status === 'warning' || status === 'critical') {
-        alerts.push({ sensorType, value, status });
+      if (statusResult.status === 'warning' || statusResult.status === 'critical') {
+        alerts.push({ 
+          sensorType, 
+          value, 
+          status: statusResult.status,
+          level: statusResult.level,
+          direction: statusResult.direction,
+          threshold: statusResult.threshold,
+          deviation: statusResult.deviation
+        });
       }
     }
     
@@ -98,7 +123,16 @@ const batchUploadSensorData = async (req, res, next) => {
     await updatePondCurrentWaterQualityBatch(pondId, latestData);
     
     for (const alert of alerts) {
-      await checkAndGenerateAlert(pondId, alert.sensorType, alert.value, alert.status);
+      await checkAndGenerateAlert(
+        pondId, 
+        alert.sensorType, 
+        alert.value, 
+        alert.status,
+        alert.level,
+        alert.direction,
+        alert.threshold,
+        alert.deviation
+      );
     }
     
     autoControlDevices(pondId, latestData);
@@ -220,41 +254,98 @@ const getSensorStatistics = async (req, res, next) => {
 };
 
 const evaluateSensorStatus = (sensorType, value, thresholds) => {
-  if (!thresholds) return 'normal';
+  if (!thresholds) {
+    return {
+      status: 'normal',
+      level: 'low',
+      direction: null,
+      threshold: null,
+      deviation: 0
+    };
+  }
+  
+  let min = null, max = null;
   
   switch (sensorType) {
     case 'temperature':
-      if (value < thresholds.temperatureMin * 0.9 || value > thresholds.temperatureMax * 1.1) {
-        return 'critical';
-      }
-      if (value < thresholds.temperatureMin || value > thresholds.temperatureMax) {
-        return 'warning';
-      }
+      min = thresholds.temperatureMin;
+      max = thresholds.temperatureMax;
       break;
-      
     case 'oxygen':
-      if (value < thresholds.oxygenMin * 0.7) {
-        return 'critical';
-      }
-      if (value < thresholds.oxygenMin) {
-        return 'warning';
-      }
+      min = thresholds.oxygenMin;
+      max = null;
       break;
-      
     case 'ph':
-      if (value < thresholds.phMin * 0.95 || value > thresholds.phMax * 1.05) {
-        return 'critical';
-      }
-      if (value < thresholds.phMin || value > thresholds.phMax) {
-        return 'warning';
-      }
+      min = thresholds.phMin;
+      max = thresholds.phMax;
       break;
-      
     default:
-      return 'normal';
+      return {
+        status: 'normal',
+        level: 'low',
+        direction: null,
+        threshold: null,
+        deviation: 0
+      };
   }
   
-  return 'normal';
+  let level = null;
+  let direction = null;
+  let threshold = null;
+  let deviation = 0;
+  
+  if (min !== null && value < min) {
+    direction = 'below_threshold';
+    threshold = min;
+    deviation = ((min - value) / min) * 100;
+    
+    if (sensorType === 'oxygen') {
+      if (deviation < 10) level = 'medium';
+      else if (deviation < 30) level = 'high';
+      else level = 'critical';
+    } else if (sensorType === 'temperature') {
+      if (deviation < 5) level = 'low';
+      else if (deviation < 10) level = 'medium';
+      else if (deviation < 20) level = 'high';
+      else level = 'critical';
+    } else {
+      if (deviation < 2) level = 'low';
+      else if (deviation < 5) level = 'medium';
+      else if (deviation < 10) level = 'high';
+      else level = 'critical';
+    }
+  }
+  else if (max !== null && value > max) {
+    direction = 'over_threshold';
+    threshold = max;
+    deviation = ((value - max) / max) * 100;
+    
+    if (sensorType === 'temperature') {
+      if (deviation < 5) level = 'low';
+      else if (deviation < 10) level = 'medium';
+      else if (deviation < 20) level = 'high';
+      else level = 'critical';
+    } else {
+      if (deviation < 2) level = 'low';
+      else if (deviation < 5) level = 'medium';
+      else if (deviation < 10) level = 'high';
+      else level = 'critical';
+    }
+  }
+  
+  if (!level) {
+    return {
+      status: 'normal',
+      level: 'low',
+      direction: null,
+      threshold: null,
+      deviation: 0
+    };
+  }
+  
+  const status = (level === 'high' || level === 'critical') ? 'critical' : 'warning';
+  
+  return { status, level, direction, threshold, deviation: Math.round(deviation * 100) / 100 };
 };
 
 const getDefaultUnit = (sensorType) => {

@@ -15,17 +15,23 @@ const generateAlertNo = () => {
   return `ALT${dateStr}${random}`;
 };
 
-const checkAndGenerateAlert = async (pondId, sensorType, value, status) => {
+const checkAndGenerateAlert = async (pondId, sensorType, value, status, forceLevel, forceDirection, forceThreshold, deviation) => {
   try {
     const pond = await Pond.findById(pondId);
     if (!pond) return null;
     
-    const threshold = getThresholdForSensor(sensorType, pond.thresholds);
-    const alertLevel = status === 'critical' ? config.alertLevels.CRITICAL : 
-                       status === 'warning' ? config.alertLevels.MEDIUM : 
-                       config.alertLevels.LOW;
+    let threshold = forceThreshold;
+    if (!threshold) {
+      const thresholdResult = getThresholdForSensor(sensorType, pond.thresholds, value);
+      threshold = thresholdResult.threshold;
+      forceDirection = forceDirection || thresholdResult.direction;
+    }
     
-    const alertType = value < threshold ? 'below_threshold' : 'over_threshold';
+    const alertLevel = forceLevel || (status === 'critical' ? config.alertLevels.CRITICAL : 
+                       status === 'warning' ? config.alertLevels.MEDIUM : 
+                       config.alertLevels.LOW);
+    
+    const alertType = forceDirection || (value < threshold ? 'below_threshold' : 'over_threshold');
     
     const existingActiveAlert = await Alert.findOne({
       pond: pondId,
@@ -37,10 +43,17 @@ const checkAndGenerateAlert = async (pondId, sensorType, value, status) => {
     if (existingActiveAlert) {
       existingActiveAlert.value = value;
       existingActiveAlert.level = alertLevel;
-      existingActiveAlert.message = generateAlertMessage(sensorType, alertType, value, threshold, alertLevel);
+      existingActiveAlert.threshold = threshold;
+      existingActiveAlert.message = generateAlertMessage(sensorType, alertType, value, threshold, alertLevel, deviation);
       await existingActiveAlert.save();
       
       websocket.emitToAll('alert:update', existingActiveAlert);
+      
+      if (existingActiveAlert.workOrder) {
+        await updateWorkOrderFromAlert(existingActiveAlert, threshold, deviation);
+      } else if (alertLevel === config.alertLevels.HIGH || alertLevel === config.alertLevels.CRITICAL) {
+        await generateWorkOrderFromAlert(existingActiveAlert, pond);
+      }
       
       return existingActiveAlert;
     }
@@ -54,7 +67,7 @@ const checkAndGenerateAlert = async (pondId, sensorType, value, status) => {
       value,
       threshold,
       unit: getSensorUnit(sensorType),
-      message: generateAlertMessage(sensorType, alertType, value, threshold, alertLevel)
+      message: generateAlertMessage(sensorType, alertType, value, threshold, alertLevel, deviation)
     });
     
     await alert.save();
@@ -258,19 +271,39 @@ const getAlertStatistics = async (req, res, next) => {
   }
 };
 
-const getThresholdForSensor = (sensorType, thresholds) => {
-  if (!thresholds) return 0;
+const getThresholdForSensor = (sensorType, thresholds, value) => {
+  if (!thresholds) return { threshold: 0, direction: null, thresholdType: null };
+  
+  let min = null, max = null;
   
   switch (sensorType) {
     case 'temperature':
-      return thresholds.temperatureMin;
+      min = thresholds.temperatureMin;
+      max = thresholds.temperatureMax;
+      break;
     case 'oxygen':
-      return thresholds.oxygenMin;
+      min = thresholds.oxygenMin;
+      max = null;
+      break;
     case 'ph':
-      return thresholds.phMin;
+      min = thresholds.phMin;
+      max = thresholds.phMax;
+      break;
     default:
-      return 0;
+      return { threshold: 0, direction: null, thresholdType: null };
   }
+  
+  if (min !== null && value !== undefined && value < min) {
+    return { threshold: min, direction: 'below_threshold', thresholdType: '下限' };
+  }
+  if (max !== null && value !== undefined && value > max) {
+    return { threshold: max, direction: 'over_threshold', thresholdType: '上限' };
+  }
+  
+  if (min !== null) {
+    return { threshold: min, direction: 'below_threshold', thresholdType: '下限' };
+  }
+  return { threshold: max, direction: 'over_threshold', thresholdType: '上限' };
 };
 
 const getSensorUnit = (sensorType) => {
@@ -285,7 +318,7 @@ const getSensorUnit = (sensorType) => {
   return units[sensorType] || '';
 };
 
-const generateAlertMessage = (sensorType, alertType, value, threshold, level) => {
+const generateAlertMessage = (sensorType, alertType, value, threshold, level, deviation) => {
   const sensorNames = {
     temperature: '水温',
     oxygen: '溶氧',
@@ -304,9 +337,12 @@ const generateAlertMessage = (sensorType, alertType, value, threshold, level) =>
   
   const sensorName = sensorNames[sensorType] || sensorType;
   const direction = alertType === 'below_threshold' ? '低于' : '超过';
+  const thresholdType = alertType === 'below_threshold' ? '下限' : '上限';
   const levelName = levelNames[level] || level;
+  const unit = getSensorUnit(sensorType);
+  const devText = deviation !== undefined && deviation !== null ? `，偏离${Math.round(deviation * 100) / 100}%` : '';
   
-  return `【${levelName}级预警】${sensorName}${direction}阈值：当前值${value}${getSensorUnit(sensorType)}，阈值${threshold}${getSensorUnit(sensorType)}`;
+  return `【${levelName}级预警】${sensorName}${direction}${thresholdType}阈值：当前值${value}${unit}，${thresholdType}阈值${threshold}${unit}${devText}`;
 };
 
 const updatePondStatus = async (pondId, alertLevel) => {
@@ -364,19 +400,32 @@ const generateWorkOrderFromAlert = async (alert, pond) => {
       ]}
     });
     
+    const thresholdType = alert.type === 'below_threshold' ? '下限' : '上限';
+    const workOrderDescription = alert.message + `（阈值类型：${thresholdType}）`;
+    const levelPriority = {
+      low: 1,
+      medium: 2,
+      high: 3,
+      critical: 4
+    };
+    
     if (existingOrder) {
       existingOrder.level = alert.level;
-      existingOrder.description = alert.message;
+      existingOrder.description = workOrderDescription;
+      existingOrder.priority = levelPriority[alert.level] || existingOrder.priority;
       existingOrder.sensorData = [{
         sensorType: alert.sensorType,
         value: alert.value,
         threshold: alert.threshold,
+        thresholdType: thresholdType,
         unit: alert.unit
       }];
       await existingOrder.save();
       
       alert.workOrder = existingOrder._id;
       await alert.save();
+      
+      websocket.emitToAll('workOrder:update', existingOrder);
       
       return existingOrder;
     }
@@ -387,14 +436,15 @@ const generateWorkOrderFromAlert = async (alert, pond) => {
       level: alert.level,
       pond: alert.pond,
       alertType: alert.sensorType,
-      description: alert.message,
+      description: workOrderDescription,
       sensorData: [{
         sensorType: alert.sensorType,
         value: alert.value,
         threshold: alert.threshold,
+        thresholdType: thresholdType,
         unit: alert.unit
       }],
-      priority: alert.level === config.alertLevels.CRITICAL ? 4 : 3
+      priority: levelPriority[alert.level] || (alert.level === config.alertLevels.CRITICAL ? 4 : 3)
     });
     
     await order.save();
@@ -404,10 +454,46 @@ const generateWorkOrderFromAlert = async (alert, pond) => {
     
     await autoAssignWorkOrder(order);
     
+    websocket.emitToAll('workOrder:new', order);
+    
     return order;
   } catch (error) {
     console.error('从告警生成工单失败:', error);
     return null;
+  }
+};
+
+const updateWorkOrderFromAlert = async (alert, threshold, deviation) => {
+  try {
+    if (!alert.workOrder) return;
+    
+    const order = await WorkOrder.findById(alert.workOrder);
+    if (!order) return;
+    
+    const thresholdType = alert.type === 'below_threshold' ? '下限' : '上限';
+    order.level = alert.level;
+    order.description = alert.message + `（阈值类型：${thresholdType}）`;
+    order.sensorData = [{
+      sensorType: alert.sensorType,
+      value: alert.value,
+      threshold: threshold || alert.threshold,
+      thresholdType: thresholdType,
+      unit: alert.unit,
+      deviation: deviation
+    }];
+    
+    const levelPriority = {
+      low: 1,
+      medium: 2,
+      high: 3,
+      critical: 4
+    };
+    order.priority = levelPriority[alert.level] || order.priority;
+    
+    await order.save();
+    websocket.emitToAll('workOrder:update', order);
+  } catch (error) {
+    console.error('更新关联工单失败:', error);
   }
 };
 
@@ -420,5 +506,6 @@ module.exports = {
   getAlertStatistics,
   updatePondStatus,
   checkAndUpdatePondStatus,
-  generateWorkOrderFromAlert
+  generateWorkOrderFromAlert,
+  updateWorkOrderFromAlert
 };

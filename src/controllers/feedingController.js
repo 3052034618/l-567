@@ -425,6 +425,14 @@ const scheduleFeeding = async (pondId, scheduledTime) => {
       return null;
     }
     
+    const feedAmount = result.amount;
+    
+    const pond = await Pond.findById(pondId);
+    if (!pond) {
+      console.error('定时投喂失败：养殖池不存在');
+      return null;
+    }
+    
     const feeder = await Device.findOne({
       pond: pondId,
       type: config.deviceTypes.FEEDER,
@@ -435,7 +443,7 @@ const scheduleFeeding = async (pondId, scheduledTime) => {
       pond: pondId,
       feeder: feeder?._id || null,
       scheduledTime: scheduledTime || Date.now(),
-      plannedAmount: result.amount,
+      plannedAmount: feedAmount,
       feedingType: 'scheduled',
       status: feeder ? 'scheduled' : 'failed',
       calculationFactors: result.factors,
@@ -444,10 +452,53 @@ const scheduleFeeding = async (pondId, scheduledTime) => {
     });
     
     await feedingRecord.save();
+    await feedingRecord.populate('pond', 'pondNo name');
+    
+    if (!feeder) {
+      console.warn(`[定时投喂] ${pond.pondNo || pondId}: 没有可用投喂设备，已记录失败状态`);
+      
+      const allFeeders = await Device.find({
+        pond: pondId,
+        type: config.deviceTypes.FEEDER
+      });
+      
+      const targetFeeder = allFeeders[0] || {
+        _id: null,
+        name: '投喂机(未知)'
+      };
+      
+      await generateFeederFaultOrder(pondId, {
+        _id: targetFeeder._id || new mongoose.Types.ObjectId(),
+        name: targetFeeder.name
+      }, '没有可用的投喂设备或所有设备均处于故障状态');
+      
+      websocket.emitToAll('feeding:new', feedingRecord);
+      return feedingRecord;
+    }
+    
+    console.log(`[定时投喂] ${pond.pondNo}开始投喂，计划投喂量: ${feedAmount}kg`);
+    
+    const success = await executeFeedingCommand(feeder, feedAmount, feedingRecord);
+    
+    if (!success) {
+      feedingRecord.status = 'failed';
+      feedingRecord.actualTime = Date.now();
+      feedingRecord.failureReason = '投喂设备执行失败';
+      await feedingRecord.save();
+      
+      await generateFeederFaultOrder(pondId, feeder, '定时投喂执行失败，设备运行异常');
+      
+      console.error(`[定时投喂] ${pond.pondNo}投喂失败，已生成维修工单`);
+    } else {
+      console.log(`[定时投喂] ${pond.pondNo}投喂完成，实际投喂量: ${feedingRecord.actualAmount}kg`);
+    }
+    
+    websocket.emitToAll('feeding:new', feedingRecord);
+    websocket.emitToAll('feeding:complete', feedingRecord);
     
     return feedingRecord;
   } catch (error) {
-    console.error('创建计划投喂失败:', error);
+    console.error('执行定时投喂失败:', error);
     return null;
   }
 };

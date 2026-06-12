@@ -14,8 +14,8 @@ router.use(authMiddleware);
 
 router.get('/', getFeedingRecords);
 router.get('/statistics', getFeedingStatistics);
-router.get('/:id', getFeedingRecordById);
 router.get('/calculate/:pondId', calculateFeedAmountApi);
+router.get('/:id', getFeedingRecordById);
 
 router.post('/trigger', roleMiddleware('admin', 'supervisor', 'worker'), triggerFeeding);
 

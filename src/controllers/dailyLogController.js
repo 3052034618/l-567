@@ -75,10 +75,18 @@ const calculateWaterQualityStats = async (pondId, startDate, endDate) => {
         timestamp: { $gte: startDate, $lt: endDate }
       });
       
+      const suffixMap = {
+        'temperature': 'Temperature',
+        'oxygen': 'Oxygen',
+        'ph': 'PH',
+        'activity': 'Activity'
+      };
+      const suffix = suffixMap[type] || type.charAt(0).toUpperCase() + type.slice(1);
+      
       if (data.length === 0) {
-        stats[`avg${type.charAt(0).toUpperCase() + type.slice(1)}`] = null;
-        stats[`min${type.charAt(0).toUpperCase() + type.slice(1)}`] = null;
-        stats[`max${type.charAt(0).toUpperCase() + type.slice(1)}`] = null;
+        stats[`avg${suffix}`] = null;
+        stats[`min${suffix}`] = null;
+        stats[`max${suffix}`] = null;
         continue;
       }
       
@@ -87,9 +95,9 @@ const calculateWaterQualityStats = async (pondId, startDate, endDate) => {
       const min = Math.min(...values);
       const max = Math.max(...values);
       
-      stats[`avg${type.charAt(0).toUpperCase() + type.slice(1)}`] = Math.round(avg * 100) / 100;
-      stats[`min${type.charAt(0).toUpperCase() + type.slice(1)}`] = min;
-      stats[`max${type.charAt(0).toUpperCase() + type.slice(1)}`] = max;
+      stats[`avg${suffix}`] = Math.round(avg * 100) / 100;
+      stats[`min${suffix}`] = min;
+      stats[`max${suffix}`] = max;
     }
     
     return stats;
@@ -402,8 +410,11 @@ const exportDailyLogs = async (req, res, next) => {
       { header: '最高水温(°C)', key: 'maxTemp', width: 14 },
       { header: '最低水温(°C)', key: 'minTemp', width: 14 },
       { header: '平均溶氧(mg/L)', key: 'avgOxygen', width: 14 },
+      { header: '最高溶氧(mg/L)', key: 'maxOxygen', width: 14 },
       { header: '最低溶氧(mg/L)', key: 'minOxygen', width: 14 },
       { header: '平均pH', key: 'avgPH', width: 10 },
+      { header: '最高pH', key: 'maxPH', width: 10 },
+      { header: '最低pH', key: 'minPH', width: 10 },
       { header: '投喂总量(kg)', key: 'totalFeed', width: 14 },
       { header: '投喂次数', key: 'feedCount', width: 10 },
       { header: '增氧机运行(分钟)', key: 'oxygenRuntime', width: 16 },
@@ -418,16 +429,29 @@ const exportDailyLogs = async (req, res, next) => {
     ];
     
     logs.forEach(log => {
+      const wq = log.waterQuality || {};
+      
+      const formatNum = (val, decimals = 2) => {
+        if (val === null || val === undefined || val === '') return '';
+        if (typeof val === 'number') {
+          return Number.isInteger(val) ? val : val.toFixed(decimals);
+        }
+        return val;
+      };
+      
       worksheet.addRow({
         date: log.date ? new Date(log.date).toLocaleDateString('zh-CN') : '',
         pondNo: log.pondNo,
         pondName: log.pond?.name || '',
-        avgTemp: log.waterQuality?.avgTemperature?.toFixed?.(2) || '',
-        maxTemp: log.waterQuality?.maxTemperature || '',
-        minTemp: log.waterQuality?.minTemperature || '',
-        avgOxygen: log.waterQuality?.avgOxygen?.toFixed?.(2) || '',
-        minOxygen: log.waterQuality?.minOxygen || '',
-        avgPH: log.waterQuality?.avgPH?.toFixed?.(2) || '',
+        avgTemp: formatNum(wq.avgTemperature),
+        maxTemp: formatNum(wq.maxTemperature, 1),
+        minTemp: formatNum(wq.minTemperature, 1),
+        avgOxygen: formatNum(wq.avgOxygen),
+        maxOxygen: formatNum(wq.maxOxygen, 1),
+        minOxygen: formatNum(wq.minOxygen, 1),
+        avgPH: formatNum(wq.avgPH, 2),
+        maxPH: formatNum(wq.maxPH, 2),
+        minPH: formatNum(wq.minPH, 2),
         totalFeed: log.feeding?.totalFeedAmount || 0,
         feedCount: log.feeding?.feedingCount || 0,
         oxygenRuntime: Math.round(log.energy?.oxygenPumpRuntime || 0),
@@ -490,19 +514,25 @@ const getDailyLogSummary = async (req, res, next) => {
     
     let totalTemp = 0, tempCount = 0;
     let totalOxygen = 0, oxygenCount = 0;
+    let totalPH = 0, phCount = 0;
     let totalFeed = 0;
     let totalPower = 0;
     let totalAlerts = 0;
     let totalOrders = 0;
     
     logs.forEach(log => {
-      if (log.waterQuality?.avgTemperature !== null && log.waterQuality?.avgTemperature !== undefined) {
-        totalTemp += log.waterQuality.avgTemperature;
+      const wq = log.waterQuality || {};
+      if (wq.avgTemperature !== null && wq.avgTemperature !== undefined) {
+        totalTemp += wq.avgTemperature;
         tempCount++;
       }
-      if (log.waterQuality?.avgOxygen !== null && log.waterQuality?.avgOxygen !== undefined) {
-        totalOxygen += log.waterQuality.avgOxygen;
+      if (wq.avgOxygen !== null && wq.avgOxygen !== undefined) {
+        totalOxygen += wq.avgOxygen;
         oxygenCount++;
+      }
+      if (wq.avgPH !== null && wq.avgPH !== undefined) {
+        totalPH += wq.avgPH;
+        phCount++;
       }
       totalFeed += log.feeding?.totalFeedAmount || 0;
       totalPower += log.energy?.totalPowerConsumption || 0;
@@ -515,6 +545,7 @@ const getDailyLogSummary = async (req, res, next) => {
       data: {
         avgTemperature: tempCount > 0 ? Math.round(totalTemp / tempCount * 100) / 100 : 0,
         avgOxygen: oxygenCount > 0 ? Math.round(totalOxygen / oxygenCount * 100) / 100 : 0,
+        avgPH: phCount > 0 ? Math.round(totalPH / phCount * 100) / 100 : 0,
         totalFeed: Math.round(totalFeed * 100) / 100,
         totalPower: Math.round(totalPower * 100) / 100,
         totalAlerts,

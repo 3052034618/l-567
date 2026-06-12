@@ -367,38 +367,79 @@ const completeWorkOrder = async (req, res, next) => {
   }
 };
 
-const checkForStubbornDefect = async (workOrder) => {
+const checkForStubbornDefect = async (workOrder, fromPhoto = false) => {
   try {
     const thirtyDaysAgo = new Date();
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - config.stubbornDefectDays);
     
-    const similarOrders = await WorkOrder.find({
+    const query = {
       _id: { $ne: workOrder._id },
       pond: workOrder.pond,
       type: workOrder.type,
       alertType: workOrder.alertType,
-      status: config.workOrderStatus.COMPLETED,
-      completedAt: { $gte: thirtyDaysAgo }
-    });
+      $or: [
+        { status: config.workOrderStatus.COMPLETED, completedAt: { $gte: thirtyDaysAgo } },
+        { 'photos.0': { $exists: true }, createdAt: { $gte: thirtyDaysAgo } }
+      ]
+    };
     
-    if (similarOrders.length >= 2) {
+    const similarOrders = await WorkOrder.find(query);
+    
+    const currentHasPhoto = workOrder.photos && workOrder.photos.length > 0;
+    const isCurrentCompleted = workOrder.status === config.workOrderStatus.COMPLETED;
+    
+    let matchingCount = similarOrders.length;
+    
+    if (fromPhoto) {
+      const photoSimilarOrders = similarOrders.filter(o => 
+        (o.photos && o.photos.length > 0) || 
+        o.status === config.workOrderStatus.COMPLETED
+      );
+      matchingCount = photoSimilarOrders.length;
+    }
+    
+    if (matchingCount >= 2 && !workOrder.isStubbornDefect) {
       workOrder.isStubbornDefect = true;
       workOrder.relatedOrders = similarOrders.map(o => o._id);
       workOrder.notifiedSupervisor = true;
       await workOrder.save();
       
+      await workOrder.populate('pond', 'pondNo name');
+      
       const supervisors = await User.find({ role: 'supervisor', status: 'active' });
       supervisors.forEach(supervisor => {
-        websocket.emitToUser(supervisor._id.toString(), 'stubbornDefect:new', workOrder);
+        websocket.emitToUser(supervisor._id.toString(), 'stubbornDefect:new', {
+          ...workOrder.toObject(),
+          pond: workOrder.pond,
+          triggeredBy: fromPhoto ? 'photo_upload' : 'completion',
+          matchingCount: matchingCount + 1,
+          message: `【顽固缺陷预警】${workOrder.pond?.pondNo || ''}${workOrder.alertType || workOrder.type}问题在30天内已出现${matchingCount + 1}次，请主管关注！`
+        });
       });
       
-      similarOrders.forEach(async (order) => {
-        order.isStubbornDefect = true;
-        await order.save();
+      websocket.emitToAll('stubbornDefect:detected', {
+        workOrderId: workOrder._id,
+        pondNo: workOrder.pond?.pondNo,
+        matchingCount: matchingCount + 1,
+        triggeredBy: fromPhoto ? 'photo_upload' : 'completion'
       });
+      
+      for (const order of similarOrders) {
+        if (!order.isStubbornDefect) {
+          order.isStubbornDefect = true;
+          await order.save();
+        }
+      }
+      
+      console.log(`[顽固缺陷] 检测到顽固缺陷！工单: ${workOrder.orderNo}, 池号: ${workOrder.pond?.pondNo}, 同类问题次数: ${matchingCount + 1}`);
+      
+      return true;
     }
+    
+    return false;
   } catch (error) {
     console.error('检查顽固缺陷失败:', error);
+    return false;
   }
 };
 
@@ -577,11 +618,15 @@ const uploadWorkOrderPhoto = async (req, res, next) => {
       photo: order.photos[order.photos.length - 1]
     });
     
+    const isStubborn = await checkForStubbornDefect(order, true);
+    
     res.json({
       success: true,
       data: {
         url: photoUrl,
-        uploadedAt: Date.now()
+        uploadedAt: Date.now(),
+        isStubbornDefect: isStubborn,
+        stubbornDefectNotified: isStubborn
       }
     });
   } catch (error) {
