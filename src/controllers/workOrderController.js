@@ -75,16 +75,123 @@ const getWorkOrderById = async (req, res, next) => {
       .populate('pond', 'pondNo name location')
       .populate('assignedTo', 'realName phone role')
       .populate('handledBy', 'realName')
-      .populate('device', 'name type status')
-      .populate('relatedOrders', 'orderNo status level createdAt');
+      .populate('reviewedBy', 'realName')
+      .populate('closedBy', 'realName')
+      .populate('device', 'name type status lastFaultTime')
+      .populate('relatedOrders', 'orderNo status level createdAt description')
+      .populate('photos.uploadedBy', 'realName')
+      .populate('reviewHistory.by', 'realName role')
+      .populate('reviewHistory.photosSnapshot.uploadedBy', 'realName')
+      .populate('feedingRecord', 'plannedAmount actualAmount scheduledTime actualTime status failureReason consumedRatio workOrder')
+      .populate('relatedFeedingRecords', 'plannedAmount actualAmount scheduledTime status');
     
     if (!order) {
       return res.status(404).json({ message: '工单不存在' });
     }
     
+    const timeline = [];
+    
+    timeline.push({
+      id: `${order._id}-created`,
+      timestamp: order.createdAt,
+      event: '工单创建',
+      type: 'created',
+      details: {
+        orderNo: order.orderNo,
+        type: order.type,
+        level: order.level,
+        description: order.description
+      },
+      actor: null
+    });
+    
+    if (order.assignedAt) {
+      timeline.push({
+        id: `${order._id}-assigned`,
+        timestamp: order.assignedAt,
+        event: '工单分派',
+        type: 'assigned',
+        details: {
+          assignedTo: order.assignedTo?.realName,
+          phone: order.assignedTo?.phone
+        },
+        actor: order.assignedTo?._id
+      });
+    }
+    
+    if (order.startedAt) {
+      timeline.push({
+        id: `${order._id}-started`,
+        timestamp: order.startedAt,
+        event: '开始处理',
+        type: 'started',
+        details: {},
+        actor: order.assignedTo?._id
+      });
+    }
+    
+    if (order.photos && order.photos.length > 0) {
+      order.photos.forEach((photo, idx) => {
+        timeline.push({
+          id: `${order._id}-photo-${idx}`,
+          timestamp: photo.uploadedAt,
+          event: '上传处理照片',
+          type: 'photo',
+          details: {
+            url: photo.url,
+            uploadedBy: photo.uploadedBy?.realName
+          },
+          actor: photo.uploadedBy?._id
+        });
+      });
+    }
+    
+    if (order.reviewHistory && order.reviewHistory.length > 0) {
+      order.reviewHistory.forEach((h, idx) => {
+        const actionNames = {
+          submit: '提交复核',
+          approve: '复核通过',
+          return: '退回补充'
+        };
+        timeline.push({
+          id: `${order._id}-review-${idx}`,
+          timestamp: h.at,
+          event: actionNames[h.action] || h.action,
+          type: `review_${h.action}`,
+          details: {
+            notes: h.notes,
+            handlingNotes: h.handlingNotesSnapshot,
+            photosCount: (h.photosSnapshot || []).length,
+            photos: h.photosSnapshot || []
+          },
+          actor: h.by?._id,
+          actorName: h.by?.realName,
+          actorRole: h.by?.role
+        });
+      });
+    }
+    
+    if (order.completedAt) {
+      timeline.push({
+        id: `${order._id}-completed`,
+        timestamp: order.completedAt,
+        event: '工单完成',
+        type: 'completed',
+        details: {
+          reviewedBy: order.reviewedBy?.realName,
+          reviewNotes: order.reviewNotes,
+          isStubbornDefect: order.isStubbornDefect
+        },
+        actor: order.reviewedBy?._id
+      });
+    }
+    
+    timeline.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    
     res.json({
       success: true,
-      data: order
+      data: order,
+      timeline
     });
   } catch (error) {
     next(error);
@@ -355,11 +462,19 @@ const completeWorkOrder = async (req, res, next) => {
     order.handlingNotes = handlingNotes || order.handlingNotes;
     order.submittedAt = Date.now();
     
+    const photosSnapshot = order.photos ? order.photos.map(p => ({
+      url: p.url,
+      uploadedAt: p.uploadedAt,
+      uploadedBy: p.uploadedBy
+    })) : [];
+    
     order.reviewHistory.push({
       action: 'submit',
       by: req.user.id,
       at: Date.now(),
-      notes: handlingNotes
+      notes: handlingNotes,
+      photosSnapshot,
+      handlingNotesSnapshot: order.handlingNotes || ''
     });
     
     await order.save();
@@ -417,11 +532,19 @@ const approveWorkOrder = async (req, res, next) => {
     order.reviewNotes = reviewNotes || '';
     order.closedBy = req.user.id;
     
+    const approvePhotosSnapshot = order.photos ? order.photos.map(p => ({
+      url: p.url,
+      uploadedAt: p.uploadedAt,
+      uploadedBy: p.uploadedBy
+    })) : [];
+    
     order.reviewHistory.push({
       action: 'approve',
       by: req.user.id,
       at: Date.now(),
-      notes: reviewNotes
+      notes: reviewNotes,
+      photosSnapshot: approvePhotosSnapshot,
+      handlingNotesSnapshot: order.handlingNotes || ''
     });
     
     await order.save();
@@ -482,11 +605,19 @@ const returnWorkOrder = async (req, res, next) => {
     order.reviewedAt = Date.now();
     order.returnReason = returnReason;
     
+    const returnPhotosSnapshot = order.photos ? order.photos.map(p => ({
+      url: p.url,
+      uploadedAt: p.uploadedAt,
+      uploadedBy: p.uploadedBy
+    })) : [];
+    
     order.reviewHistory.push({
       action: 'return',
       by: req.user.id,
       at: Date.now(),
-      notes: returnReason
+      notes: returnReason,
+      photosSnapshot: returnPhotosSnapshot,
+      handlingNotesSnapshot: order.handlingNotes || ''
     });
     
     await order.save();

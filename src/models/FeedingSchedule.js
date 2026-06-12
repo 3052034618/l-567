@@ -80,13 +80,27 @@ const feedingScheduleSchema = new mongoose.Schema({
   version: {
     type: Number,
     default: 1
+  },
+  
+  previousVersion: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'FeedingSchedule'
+  },
+  
+  supersededAt: Date,
+  
+  status: {
+    type: String,
+    enum: ['draft', 'active', 'superseded', 'archived'],
+    default: 'active'
   }
 }, {
   timestamps: true
 });
 
-feedingScheduleSchema.index({ pond: 1, isActive: 1 });
+feedingScheduleSchema.index({ pond: 1, status: 1 });
 feedingScheduleSchema.index({ effectiveFrom: 1 });
+feedingScheduleSchema.index({ pond: 1, effectiveFrom: -1 });
 
 feedingScheduleSchema.methods.validateMealsRatio = function() {
   const totalRatio = this.meals.reduce((sum, meal) => sum + meal.ratio, 0);
@@ -145,5 +159,83 @@ feedingScheduleSchema.pre('save', function(next) {
   }
   next();
 });
+
+feedingScheduleSchema.statics.findEffectiveForDate = async function(pondId, date) {
+  const targetDate = new Date(date);
+  targetDate.setHours(23, 59, 59, 999);
+  
+  const schedules = await this.find({
+    pond: pondId,
+    effectiveFrom: { $lte: targetDate },
+    status: { $ne: 'archived' }
+  }).sort({ effectiveFrom: -1, version: -1 });
+  
+  if (schedules.length === 0) return null;
+  
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const targetDay = new Date(date);
+  targetDay.setHours(0, 0, 0, 0);
+  
+  if (targetDay.getTime() === today.getTime()) {
+    const activeSuperseded = schedules.find(s => s.status === 'superseded');
+    const activeNow = schedules.find(s => s.status === 'active' && new Date(s.effectiveFrom).setHours(0,0,0,0) <= today.getTime());
+    
+    if (activeSuperseded && activeNow) {
+      const nowEffective = new Date(activeNow.effectiveFrom);
+      nowEffective.setHours(0, 0, 0, 0);
+      if (nowEffective.getTime() > today.getTime()) {
+        return activeSuperseded;
+      }
+    }
+  }
+  
+  return schedules[0];
+};
+
+feedingScheduleSchema.statics.findAllVersions = async function(pondId) {
+  return this.find({ pond: pondId })
+    .sort({ version: 1 })
+    .populate('previousVersion')
+    .populate('createdBy', 'realName')
+    .populate('updatedBy', 'realName')
+    .populate('suspensions.createdBy', 'realName');
+};
+
+feedingScheduleSchema.methods.mergeSuspensionsFrom = function(sourceSchedule) {
+  if (!sourceSchedule || !sourceSchedule.suspensions) return this;
+  
+  const existingDates = new Set(
+    this.suspensions.map(s => {
+      const d = new Date(s.date);
+      d.setHours(0, 0, 0, 0);
+      return d.getTime();
+    })
+  );
+  
+  sourceSchedule.suspensions.forEach(s => {
+    const sd = new Date(s.date);
+    sd.setHours(0, 0, 0, 0);
+    if (!existingDates.has(sd.getTime())) {
+      this.suspensions.push({
+        date: sd,
+        reason: s.reason,
+        createdBy: s.createdBy,
+        createdAt: s.createdAt
+      });
+    }
+  });
+  
+  return this;
+};
+
+feedingScheduleSchema.methods.hasMealAt = function(timeStr) {
+  return this.meals.some(m => m.time === timeStr);
+};
+
+feedingScheduleSchema.methods.getMealRatio = function(timeStr) {
+  const meal = this.meals.find(m => m.time === timeStr);
+  return meal ? meal.ratio : null;
+};
 
 module.exports = mongoose.model('FeedingSchedule', feedingScheduleSchema);

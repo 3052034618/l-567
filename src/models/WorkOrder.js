@@ -144,7 +144,26 @@ const workOrderSchema = new mongoose.Schema({
       ref: 'User'
     },
     at: Date,
-    notes: String
+    notes: String,
+    photosSnapshot: [{
+      url: String,
+      uploadedAt: Date,
+      uploadedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User'
+      }
+    }],
+    handlingNotesSnapshot: String
+  }],
+  
+  feedingRecord: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'FeedingRecord'
+  },
+  
+  relatedFeedingRecords: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'FeedingRecord'
   }]
 }, {
   timestamps: true

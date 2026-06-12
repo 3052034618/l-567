@@ -223,30 +223,65 @@ const triggerFeeding = async (req, res, next) => {
 
 const executeFeedingCommand = async (feeder, amount, feedingRecord) => {
   try {
+    feedingRecord.addExecutionLog('in_progress', `投喂机${feeder.name || feeder._id}开始执行，计划投喂${amount}kg`);
+    
     feeder.status = config.deviceStatus.RUNNING;
     await feeder.save();
     
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-    feedingRecord.status = 'completed';
-    feedingRecord.actualTime = Date.now();
-    feedingRecord.actualAmount = amount;
-    feedingRecord.consumedRatio = 85 + Math.random() * 15;
+    feedingRecord.status = 'in_progress';
     await feedingRecord.save();
     
-    feeder.status = config.deviceStatus.STOPPED;
-    await feeder.save();
+    await new Promise(resolve => setTimeout(resolve, 2000));
     
-    websocket.emitToAll('feeding:complete', feedingRecord);
+    const success = Math.random() > 0.05;
     
-    return true;
+    if (success) {
+      feedingRecord.status = 'completed';
+      feedingRecord.actualTime = Date.now();
+      const variance = 1 + (Math.random() * 0.06 - 0.03);
+      feedingRecord.actualAmount = Math.round(amount * variance * 100) / 100;
+      feedingRecord.consumedRatio = 85 + Math.random() * 15;
+      feedingRecord.addExecutionLog('completed', `投喂完成，实际投喂${feedingRecord.actualAmount}kg`);
+      await feedingRecord.save();
+      
+      feeder.status = config.deviceStatus.STOPPED;
+      await feeder.save();
+      
+      websocket.emitToAll('feeding:complete', feedingRecord);
+      
+      return true;
+    } else {
+      feedingRecord.status = 'failed';
+      feedingRecord.actualTime = Date.now();
+      feedingRecord.failureReason = '投喂机执行异常：下料口堵塞或电机故障';
+      feedingRecord.addExecutionLog('failed', feedingRecord.failureReason);
+      await feedingRecord.save();
+      
+      feeder.status = config.deviceStatus.FAULT;
+      feeder.lastFaultTime = Date.now();
+      feeder.faultCount = (feeder.faultCount || 0) + 1;
+      await feeder.save();
+      
+      return false;
+    }
   } catch (error) {
     console.error('执行投喂指令失败:', error);
+    try {
+      if (feedingRecord) {
+        feedingRecord.status = 'failed';
+        feedingRecord.actualTime = Date.now();
+        feedingRecord.failureReason = `执行异常：${error.message}`;
+        feedingRecord.addExecutionLog('failed', feedingRecord.failureReason);
+        await feedingRecord.save();
+      }
+    } catch (e) {
+      console.error('投喂记录回写失败:', e);
+    }
     return false;
   }
 };
 
-const generateFeederFaultOrder = async (pondId, feeder, faultMessage) => {
+const generateFeederFaultOrder = async (pondId, feeder, faultMessage, feedingRecordId) => {
   try {
     const order = new WorkOrder({
       orderNo: generateOrderNo(),
@@ -255,13 +290,16 @@ const generateFeederFaultOrder = async (pondId, feeder, faultMessage) => {
       pond: pondId,
       device: feeder._id,
       alertType: 'feeder_fault',
-      description: `投喂设备故障：${faultMessage}`,
-      priority: 3
+      description: `投喂设备故障：${faultMessage}【设备：${feeder.name || '未知'}】${feedingRecordId ? '【关联投喂记录ID：' + feedingRecordId + '】' : ''}`,
+      priority: 3,
+      feedingRecord: feedingRecordId,
+      relatedFeedingRecords: feedingRecordId ? [feedingRecordId] : []
     });
     
     await order.save();
     await order.populate('pond', 'pondNo name');
-    await order.populate('device', 'name');
+    await order.populate('device', 'name type status');
+    await order.populate('feedingRecord', 'plannedAmount scheduledTime status failureReason');
     
     await autoAssignWorkOrder(order);
     
@@ -300,7 +338,9 @@ const getFeedingRecords = async (req, res, next) => {
       .sort({ scheduledTime: -1 })
       .populate('pond', 'pondNo name')
       .populate('feeder', 'name')
-      .populate('triggeredBy', 'realName');
+      .populate('triggeredBy', 'realName')
+      .populate('workOrder', 'orderNo type level status description')
+      .populate('feedingSchedule', 'version status');
     
     const total = await FeedingRecord.countDocuments(query);
     
@@ -324,7 +364,9 @@ const getFeedingRecordById = async (req, res, next) => {
     const record = await FeedingRecord.findById(req.params.id)
       .populate('pond', 'pondNo name')
       .populate('feeder', 'name type status')
-      .populate('triggeredBy', 'realName');
+      .populate('triggeredBy', 'realName')
+      .populate('workOrder', 'orderNo type level status description assignedTo')
+      .populate('feedingSchedule', 'version status meals totalDailyRate');
     
     if (!record) {
       return res.status(404).json({ message: '投喂记录不存在' });

@@ -116,16 +116,40 @@ const createFeedingSchedule = async (req, res, next) => {
     const effectiveDate = effectiveFrom ? new Date(effectiveFrom) : new Date();
     effectiveDate.setHours(0, 0, 0, 0);
     
-    const existingActive = await FeedingSchedule.findOne({
+    const existingSchedules = await FeedingSchedule.find({
       pond: pondId,
-      isActive: true
+      status: { $in: ['active', 'superseded'] },
+      effectiveFrom: { $lte: effectiveDate }
+    }).sort({ effectiveFrom: -1, version: -1 });
+    
+    const previousSchedules = [];
+    existingSchedules.forEach(s => {
+      if (s.status === 'active' && s.effectiveFrom.getTime() <= effectiveDate.getTime()) {
+        previousSchedules.push(s);
+      }
     });
     
-    if (existingActive) {
-      existingActive.isActive = false;
-      existingActive.updatedBy = req.user?.id;
-      await existingActive.save();
+    const allExistingActive = await FeedingSchedule.find({
+      pond: pondId,
+      status: 'active'
+    });
+    
+    let previousVersionId = null;
+    let previousScheduleForMerge = null;
+    for (const s of allExistingActive) {
+      s.status = 'superseded';
+      s.supersededAt = Date.now();
+      s.updatedBy = req.user?.id;
+      s.isActive = false;
+      await s.save();
+      if (!previousVersionId && s.version > (previousVersionId ? 1 : 0)) {
+        previousVersionId = s._id;
+        previousScheduleForMerge = s;
+      }
     }
+    
+    const nextVersion = existingSchedules.length > 0 ? 
+      Math.max(...existingSchedules.map(s => s.version)) + 1 : 1;
     
     const schedule = new FeedingSchedule({
       pond: pondId,
@@ -136,18 +160,27 @@ const createFeedingSchedule = async (req, res, next) => {
         ratio: m.ratio
       })),
       totalDailyRate: scheduleRate,
+      status: 'active',
       isActive: true,
       effectiveFrom: effectiveDate,
       createdBy: req.user?.id,
-      notes
+      notes,
+      version: nextVersion,
+      previousVersion: previousVersionId
     });
+    
+    if (previousScheduleForMerge) {
+      schedule.mergeSuspensionsFrom(previousScheduleForMerge);
+    }
     
     await schedule.save();
     
     const populatedSchedule = await FeedingSchedule.findById(schedule._id)
       .populate('pond', 'pondNo name')
       .populate('fishSpecies', 'name')
-      .populate('createdBy', 'realName');
+      .populate('createdBy', 'realName')
+      .populate('previousVersion')
+      .populate('suspensions.createdBy', 'realName');
     
     websocket.emitToAll('feedingSchedule:new', populatedSchedule);
     
@@ -180,9 +213,58 @@ const updateFeedingSchedule = async (req, res, next) => {
       }
     }
     
-    const tomorrow = new Date();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
-    tomorrow.setHours(0, 0, 0, 0);
+    
+    const scheduleEffectiveDate = new Date(schedule.effectiveFrom);
+    scheduleEffectiveDate.setHours(0, 0, 0, 0);
+    
+    let effectiveTargetDate;
+    if (scheduleEffectiveDate.getTime() >= today.getTime()) {
+      effectiveTargetDate = new Date(schedule.effectiveFrom);
+    } else {
+      effectiveTargetDate = tomorrow;
+    }
+    
+    const schedulesToCheck = await FeedingSchedule.find({
+      pond: schedule.pond,
+      status: { $in: ['active', 'superseded'] },
+      effectiveFrom: { $gte: today, $lte: effectiveTargetDate }
+    });
+    
+    let allSuspensions = [];
+    schedulesToCheck.forEach(s => {
+      s.suspensions.forEach(sus => {
+        const key = new Date(sus.date).setHours(0,0,0,0);
+        if (!allSuspensions.find(existing => 
+          new Date(existing.date).setHours(0,0,0,0) === key)) {
+          allSuspensions.push(sus);
+        }
+      });
+    });
+    
+    const allActiveSchedules = await FeedingSchedule.find({
+      pond: schedule.pond,
+      status: 'active'
+    });
+    
+    for (const s of allActiveSchedules) {
+      s.status = 'superseded';
+      s.supersededAt = Date.now();
+      s.updatedBy = req.user?.id;
+      s.isActive = false;
+      await s.save();
+      s.suspensions.forEach(sus => {
+        const key = new Date(sus.date).setHours(0,0,0,0);
+        if (!allSuspensions.find(existing => 
+          new Date(existing.date).setHours(0,0,0,0) === key)) {
+          allSuspensions.push(sus);
+        }
+      });
+    }
     
     const newSchedule = new FeedingSchedule({
       pond: schedule.pond,
@@ -190,9 +272,10 @@ const updateFeedingSchedule = async (req, res, next) => {
       growthStage: schedule.growthStage,
       meals: meals ? meals.map(m => ({ time: m.time, ratio: m.ratio })) : schedule.meals,
       totalDailyRate: totalDailyRate !== undefined ? totalDailyRate : schedule.totalDailyRate,
+      status: 'active',
       isActive: true,
-      effectiveFrom: tomorrow,
-      suspensions: schedule.suspensions.map(s => ({
+      effectiveFrom: effectiveTargetDate,
+      suspensions: allSuspensions.map(s => ({
         date: s.date,
         reason: s.reason,
         createdBy: s.createdBy,
@@ -201,31 +284,35 @@ const updateFeedingSchedule = async (req, res, next) => {
       createdBy: schedule.createdBy,
       updatedBy: req.user?.id,
       notes: notes !== undefined ? notes : schedule.notes,
-      version: schedule.version + 1
+      version: schedule.version + 1,
+      previousVersion: schedule._id
     });
     
     await newSchedule.save();
-    
-    schedule.isActive = false;
-    schedule.updatedBy = req.user?.id;
-    await schedule.save();
     
     const populatedSchedule = await FeedingSchedule.findById(newSchedule._id)
       .populate('pond', 'pondNo name')
       .populate('fishSpecies', 'name')
       .populate('createdBy', 'realName')
-      .populate('updatedBy', 'realName');
+      .populate('updatedBy', 'realName')
+      .populate('previousVersion')
+      .populate('suspensions.createdBy', 'realName');
     
     websocket.emitToAll('feedingSchedule:update', {
       oldScheduleId: id,
       newSchedule: populatedSchedule,
-      message: '计划已修改，新餐次明日生效，今日仍按原计划执行'
+      effectiveFrom: effectiveTargetDate,
+      message: scheduleEffectiveDate.getTime() >= today.getTime() 
+        ? '计划已修改，因原计划尚未生效，新计划立即按原生效日期执行' 
+        : '计划已修改，新餐次明日生效，今日仍按原计划执行'
     });
     
     res.json({
       success: true,
       data: populatedSchedule,
-      message: '投喂计划已修改，新餐次明日生效，今日仍按原计划执行'
+      message: scheduleEffectiveDate.getTime() >= today.getTime() 
+        ? '计划已修改，新计划立即按原生效日期执行' 
+        : '投喂计划已修改，新餐次明日生效，今日仍按原计划执行'
     });
   } catch (error) {
     console.error('修改投喂计划失败:', error);
@@ -235,63 +322,121 @@ const updateFeedingSchedule = async (req, res, next) => {
 
 const suspendFeeding = async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const { date, reason } = req.body;
+    const { pondId, date, reason } = req.body;
     
-    if (!date) {
-      return res.status(400).json({ message: '必须指定停喂日期' });
+    if (!pondId || !date) {
+      return res.status(400).json({ message: '必须指定养殖池ID和停喂日期' });
     }
     
-    const schedule = await FeedingSchedule.findById(id);
-    if (!schedule) {
-      return res.status(404).json({ message: '投喂计划不存在' });
+    const targetDate = new Date(date);
+    targetDate.setHours(0, 0, 0, 0);
+    
+    const pond = await Pond.findById(pondId);
+    if (!pond) {
+      return res.status(404).json({ message: '养殖池不存在' });
     }
     
-    schedule.addSuspension(date, reason, req.user.id);
-    await schedule.save();
-    await schedule.populate('pond', 'pondNo name');
+    const allSchedules = await FeedingSchedule.find({
+      pond: pondId,
+      status: { $in: ['active', 'superseded'] },
+      effectiveFrom: { $lte: targetDate }
+    }).sort({ effectiveFrom: -1 });
+    
+    if (allSchedules.length === 0) {
+      return res.status(404).json({ message: '该养殖池没有有效的投喂计划' });
+    }
+    
+    const effectiveFromCutoff = new Date(targetDate);
+    effectiveFromCutoff.setDate(effectiveFromCutoff.getDate() - 1);
+    
+    let updatedCount = 0;
+    for (const schedule of allSchedules) {
+      const scheduleEffective = new Date(schedule.effectiveFrom);
+      scheduleEffective.setHours(0, 0, 0, 0);
+      
+      if (scheduleEffective.getTime() <= targetDate.getTime()) {
+        if (!schedule.isSuspendedOn(date)) {
+          schedule.addSuspension(date, reason, req.user?.id);
+          await schedule.save();
+          updatedCount++;
+        }
+      }
+    }
+    
+    const currentSchedule = await FeedingSchedule.findEffectiveForDate(pondId, date);
     
     websocket.emitToAll('feedingSchedule:suspend', {
-      scheduleId: id,
-      pondNo: schedule.pond?.pondNo,
+      pondId,
+      pondNo: pond.pondNo,
       date,
-      reason
+      reason: reason || '临时停喂',
+      updatedScheduleCount: updatedCount
     });
     
     res.json({
       success: true,
-      data: schedule,
-      message: `已添加${new Date(date).toLocaleDateString('zh-CN')}的停喂记录`
+      data: {
+        pondId,
+        pondNo: pond.pondNo,
+        date,
+        reason: reason || '临时停喂',
+        updatedScheduleCount: updatedCount,
+        currentScheduleForDate: currentSchedule
+      },
+      message: `已为${new Date(date).toLocaleDateString('zh-CN')}添加停喂记录，同步到${updatedCount}个计划版本`
     });
   } catch (error) {
+    console.error('停喂设置失败:', error);
     next(error);
   }
 };
 
 const resumeFeeding = async (req, res, next) => {
   try {
-    const { id } = req.params;
-    const { date } = req.body;
+    const { pondId, date } = req.body;
     
-    if (!date) {
-      return res.status(400).json({ message: '必须指定恢复日期' });
+    if (!pondId || !date) {
+      return res.status(400).json({ message: '必须指定养殖池ID和恢复日期' });
     }
     
-    const schedule = await FeedingSchedule.findById(id);
-    if (!schedule) {
-      return res.status(404).json({ message: '投喂计划不存在' });
+    const targetDate = new Date(date);
+    targetDate.setHours(0, 0, 0, 0);
+    
+    const pond = await Pond.findById(pondId);
+    if (!pond) {
+      return res.status(404).json({ message: '养殖池不存在' });
     }
     
-    schedule.removeSuspension(date);
-    await schedule.save();
-    await schedule.populate('pond', 'pondNo name');
+    const allSchedules = await FeedingSchedule.find({
+      pond: pondId,
+      status: { $in: ['active', 'superseded'] }
+    });
+    
+    let updatedCount = 0;
+    for (const schedule of allSchedules) {
+      const beforeCount = schedule.suspensions.length;
+      schedule.removeSuspension(date);
+      if (schedule.suspensions.length !== beforeCount) {
+        await schedule.save();
+        updatedCount++;
+      }
+    }
+    
+    const currentSchedule = await FeedingSchedule.findEffectiveForDate(pondId, date);
     
     res.json({
       success: true,
-      data: schedule,
-      message: `已取消${new Date(date).toLocaleDateString('zh-CN')}的停喂记录`
+      data: {
+        pondId,
+        pondNo: pond.pondNo,
+        date,
+        updatedScheduleCount: updatedCount,
+        currentScheduleForDate: currentSchedule
+      },
+      message: `已取消${new Date(date).toLocaleDateString('zh-CN')}的停喂记录，同步到${updatedCount}个计划版本`
     });
   } catch (error) {
+    console.error('恢复投喂失败:', error);
     next(error);
   }
 };
@@ -304,46 +449,30 @@ const executeScheduledFeedings = async () => {
     const todayStart = new Date(now);
     todayStart.setHours(0, 0, 0, 0);
     
-    const schedules = await FeedingSchedule.find({
-      isActive: true,
-      effectiveFrom: { $lte: now },
-      'meals.time': currentTime
-    });
+    const allPonds = await Pond.find({ status: { $ne: 'maintenance' } });
     
-    if (schedules.length === 0) {
-      return;
-    }
+    if (allPonds.length === 0) return;
     
-    for (const schedule of schedules) {
+    for (const pond of allPonds) {
       try {
-        const pond = await Pond.findById(schedule.pond).populate('fishSpecies');
+        const schedule = await FeedingSchedule.findEffectiveForDate(pond._id, now);
         
-        if (!pond || pond.status === 'maintenance') {
-          console.log(`[定时投喂] 跳过池${schedule.pond}：维护中或不存在`);
-          continue;
-        }
+        if (!schedule) continue;
         
-        if (schedule.isSuspendedOn(now)) {
-          console.log(`[定时投喂] 跳过池${pond.pondNo}：今日已停喂`);
-          continue;
-        }
+        if (schedule.isSuspendedOn(now)) continue;
         
-        const currentMeal = schedule.meals.find(m => m.time === currentTime);
-        if (!currentMeal) continue;
+        if (!schedule.hasMealAt(currentTime)) continue;
+        
+        const mealRatio = schedule.getMealRatio(currentTime);
+        if (!mealRatio) continue;
         
         const calcResult = await calculateFeedAmount(pond._id.toString());
-        if (calcResult.error) {
-          console.error(`[定时投喂] 池${pond.pondNo}计算投喂量失败: ${calcResult.error}`);
-          continue;
-        }
+        if (calcResult.error) continue;
         
         const dailyTotal = calcResult.amount;
-        const mealAmount = Math.round(dailyTotal * currentMeal.ratio * 100) / 100;
+        const mealAmount = Math.round(dailyTotal * mealRatio * 100) / 100;
         
-        if (mealAmount <= 0) {
-          console.log(`[定时投喂] 池${pond.pondNo} ${currentTime} 计算投喂量为0，跳过`);
-          continue;
-        }
+        if (mealAmount <= 0) continue;
         
         const existingRecord = await FeedingRecord.findOne({
           pond: pond._id,
@@ -354,9 +483,7 @@ const executeScheduledFeedings = async () => {
           }
         });
         
-        if (existingRecord) {
-          continue;
-        }
+        if (existingRecord) continue;
         
         const feeder = await Device.findOne({
           pond: pond._id,
@@ -373,9 +500,11 @@ const executeScheduledFeedings = async () => {
           status: feeder ? 'scheduled' : 'failed',
           calculationFactors: {
             ...calcResult.factors,
-            mealRatio: currentMeal.ratio,
-            mealTime: currentMeal.time,
-            dailyTotal
+            mealRatio,
+            mealTime: currentTime,
+            dailyTotal,
+            scheduleId: schedule._id,
+            scheduleVersion: schedule.version
           },
           failureReason: feeder ? null : '没有可用的投喂设备',
           date: todayStart
@@ -385,8 +514,6 @@ const executeScheduledFeedings = async () => {
         await feedingRecord.populate('pond', 'pondNo name');
         
         if (!feeder) {
-          console.warn(`[定时投喂] ${pond.pondNo}: 没有可用投喂设备，生成维修工单`);
-          
           const faultFeeder = await Device.findOne({
             pond: pond._id,
             type: config.deviceTypes.FEEDER
@@ -397,14 +524,21 @@ const executeScheduledFeedings = async () => {
             name: '投喂机(未配置)'
           };
           
-          await generateFeederFaultOrder(pond._id, feederInfo, '没有可用的投喂设备或所有设备均处于故障状态');
+          const workOrder = await generateFeederFaultOrder(
+            pond._id, 
+            feederInfo, 
+            '没有可用的投喂设备或所有设备均处于故障状态',
+            feedingRecord._id
+          );
+          
+          if (workOrder) {
+            feedingRecord.workOrder = workOrder._id;
+            await feedingRecord.save();
+          }
           
           websocket.emitToAll('feeding:new', feedingRecord);
-          console.log(`[定时投喂] ${pond.pondNo} ${currentTime} 无投喂机，已记录失败并生成维修工单`);
           continue;
         }
-        
-        console.log(`[定时投喂] ${pond.pondNo} ${currentTime} 开始投喂，占比${(currentMeal.ratio * 100).toFixed(0)}%，计划${mealAmount}kg`);
         
         const success = await executeFeedingCommand(feeder, mealAmount, feedingRecord);
         
@@ -414,20 +548,142 @@ const executeScheduledFeedings = async () => {
           feedingRecord.failureReason = '投喂设备执行失败';
           await feedingRecord.save();
           
-          await generateFeederFaultOrder(pond._id, feeder, '定时投喂执行失败，设备运行异常');
-          console.error(`[定时投喂] ${pond.pondNo} ${currentTime} 投喂失败，已生成维修工单`);
-        } else {
-          console.log(`[定时投喂] ${pond.pondNo} ${currentTime} 投喂完成，实际${feedingRecord.actualAmount}kg`);
+          const workOrder = await generateFeederFaultOrder(
+            pond._id, 
+            feeder, 
+            '定时投喂执行失败，设备运行异常',
+            feedingRecord._id
+          );
+          
+          if (workOrder) {
+            feedingRecord.workOrder = workOrder._id;
+            await feedingRecord.save();
+          }
         }
         
         websocket.emitToAll('feeding:new', feedingRecord);
         websocket.emitToAll('feeding:complete', feedingRecord);
-      } catch (scheduleError) {
-        console.error(`[定时投喂] 处理计划${schedule._id}时出错:`, scheduleError.message);
+      } catch (pondError) {
+        console.error(`[定时投喂] 处理池${pond.pondNo || pond._id}时出错:`, pondError.message);
       }
     }
   } catch (error) {
     console.error('[定时投喂] 执行失败:', error);
+  }
+};
+
+const getPondScheduleTimeline = async (req, res, next) => {
+  try {
+    const { pondId } = req.params;
+    
+    const pond = await Pond.findById(pondId).populate('fishSpecies');
+    if (!pond) {
+      return res.status(404).json({ message: '养殖池不存在' });
+    }
+    
+    const allVersions = await FeedingSchedule.findAllVersions(pondId);
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    const dayAfterTomorrow = new Date(today);
+    dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 2);
+    
+    const currentSchedule = await FeedingSchedule.findEffectiveForDate(pondId, today);
+    const tomorrowSchedule = await FeedingSchedule.findEffectiveForDate(pondId, tomorrow);
+    const dayAfterTomorrowSchedule = await FeedingSchedule.findEffectiveForDate(pondId, dayAfterTomorrow);
+    
+    const todaySuspensions = [];
+    allVersions.forEach(s => {
+      s.suspensions.forEach(sus => {
+        const sd = new Date(sus.date);
+        sd.setHours(0, 0, 0, 0);
+        if (sd.getTime() >= today.getTime()) {
+          if (!todaySuspensions.find(ts => 
+            new Date(ts.date).setHours(0,0,0,0) === sd.getTime())) {
+            todaySuspensions.push({
+              ...sus._doc,
+              fromVersion: s.version,
+              fromVersionId: s._id
+            });
+          }
+        }
+      });
+    });
+    
+    const timeline = allVersions.map((s, idx) => {
+      const prev = s.previousVersion;
+      const next = allVersions[idx + 1];
+      
+      const startDate = new Date(s.effectiveFrom);
+      let endDate;
+      if (s.status === 'active' && s.supersededAt) {
+        endDate = new Date(s.supersededAt);
+      } else if (next) {
+        endDate = new Date(next.effectiveFrom);
+        endDate.setDate(endDate.getDate() - 1);
+      } else {
+        endDate = null;
+      }
+      
+      const isCurrent = currentSchedule && currentSchedule._id.toString() === s._id.toString();
+      const isTomorrow = tomorrowSchedule && tomorrowSchedule._id.toString() === s._id.toString() && !isCurrent;
+      const isFuture = dayAfterTomorrowSchedule && dayAfterTomorrowSchedule._id.toString() === s._id.toString() && !isCurrent && !isTomorrow;
+      
+      return {
+        _id: s._id,
+        version: s.version,
+        status: s.status,
+        growthStage: s.growthStage,
+        totalDailyRate: s.totalDailyRate,
+        meals: s.meals,
+        mealsSummary: s.meals.map(m => `${m.time}(${(m.ratio * 100).toFixed(0)}%)`).join(', '),
+        suspensions: s.suspensions,
+        effectiveFrom: s.effectiveFrom,
+        effectiveUntil: endDate,
+        createdAt: s.createdAt,
+        updatedAt: s.updatedAt,
+        supersededAt: s.supersededAt,
+        createdBy: s.createdBy,
+        updatedBy: s.updatedBy,
+        previousVersion: prev ? {
+          _id: prev._id,
+          version: prev.version,
+          mealsSummary: (prev.meals || []).map(m => `${m.time}(${(m.ratio * 100).toFixed(0)}%)`).join(', ')
+        } : null,
+        role: isCurrent ? 'current' : (isTomorrow ? 'tomorrow' : (isFuture ? 'future' : (s.status === 'archived' ? 'archived' : 'historical'))),
+        notes: s.notes
+      };
+    });
+    
+    res.json({
+      success: true,
+      data: {
+        pondId,
+        pondNo: pond.pondNo,
+        pondName: pond.name,
+        fishSpecies: pond.fishSpecies?.name,
+        current: timeline.find(t => t.role === 'current') || null,
+        tomorrow: timeline.find(t => t.role === 'tomorrow') || null,
+        timeline,
+        upcomingSuspensions: todaySuspensions,
+        versionCount: allVersions.length,
+        currentVersion: currentSchedule?.version || null,
+        tomorrowVersion: tomorrowSchedule?.version || null,
+        changePreview: currentSchedule && tomorrowSchedule && currentSchedule.version !== tomorrowSchedule.version ? {
+          fromVersion: currentSchedule.version,
+          toVersion: tomorrowSchedule.version,
+          fromMeals: currentSchedule.meals.map(m => `${m.time}(${(m.ratio * 100).toFixed(0)}%)`).join(', '),
+          toMeals: tomorrowSchedule.meals.map(m => `${m.time}(${(m.ratio * 100).toFixed(0)}%)`).join(', ')
+        } : null
+      }
+    });
+  } catch (error) {
+    console.error('查询时间线失败:', error);
+    next(error);
   }
 };
 
@@ -438,5 +694,6 @@ module.exports = {
   updateFeedingSchedule,
   suspendFeeding,
   resumeFeeding,
-  executeScheduledFeedings
+  executeScheduledFeedings,
+  getPondScheduleTimeline
 };
