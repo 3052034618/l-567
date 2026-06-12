@@ -18,6 +18,8 @@ module.exports = {
     PENDING: 'pending',
     ASSIGNED: 'assigned',
     IN_PROGRESS: 'in_progress',
+    PENDING_REVIEW: 'pending_review',
+    RETURNED: 'returned',
     COMPLETED: 'completed',
     CANCELLED: 'cancelled'
   },

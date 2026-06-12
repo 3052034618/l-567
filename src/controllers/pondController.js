@@ -1,5 +1,10 @@
 const Pond = require('../models/Pond');
 const FishSpecies = require('../models/FishSpecies');
+const SensorData = require('../models/SensorData');
+const FeedingRecord = require('../models/FeedingRecord');
+const Alert = require('../models/Alert');
+const WorkOrder = require('../models/WorkOrder');
+const Device = require('../models/Device');
 const { getGrowthStage, calculateOptimalThresholds } = require('./fishSpeciesController');
 
 const getPonds = async (req, res, next) => {
@@ -223,6 +228,296 @@ const updatePondThresholds = async (pondId) => {
   return { pond, growthStage, thresholds };
 };
 
+const getPondDailyTimeline = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { date } = req.query;
+    
+    const pond = await Pond.findById(id).populate('fishSpecies');
+    if (!pond) {
+      return res.status(404).json({ message: '养殖池不存在' });
+    }
+    
+    const targetDate = date ? new Date(date) : new Date();
+    targetDate.setHours(0, 0, 0, 0);
+    const nextDate = new Date(targetDate);
+    nextDate.setDate(nextDate.getDate() + 1);
+    
+    const timeRange = { $gte: targetDate, $lt: nextDate };
+    
+    const [sensorData, feedingRecords, alerts, workOrders] = await Promise.all([
+      SensorData.find({
+        pond: id,
+        timestamp: timeRange
+      }).sort({ timestamp: 1 }).select('sensorType value unit status timestamp'),
+      
+      FeedingRecord.find({
+        pond: id,
+        scheduledTime: timeRange
+      }).sort({ scheduledTime: 1 }).select('plannedAmount actualAmount status feedingType scheduledTime actualTime consumedRatio'),
+      
+      Alert.find({
+        pond: id,
+        timestamp: timeRange
+      }).sort({ timestamp: 1 }).select('alertNo sensorType level type value threshold message timestamp'),
+      
+      WorkOrder.find({
+        pond: id,
+        createdAt: timeRange
+      }).sort({ createdAt: 1 }).select('orderNo type level status description createdAt')
+    ]);
+    
+    const series = {
+      temperature: [],
+      oxygen: [],
+      ph: [],
+      activity: []
+    };
+    
+    sensorData.forEach(d => {
+      const point = {
+        time: d.timestamp,
+        value: d.value,
+        status: d.status
+      };
+      if (series[d.sensorType]) {
+        series[d.sensorType].push(point);
+      }
+    });
+    
+    const feedingEvents = feedingRecords.map(r => ({
+      time: r.actualTime || r.scheduledTime,
+      type: 'feeding',
+      feedingType: r.feedingType,
+      status: r.status,
+      plannedAmount: r.plannedAmount,
+      actualAmount: r.actualAmount,
+      consumedRatio: r.consumedRatio
+    }));
+    
+    const alertEvents = alerts.map(a => ({
+      time: a.timestamp,
+      type: 'alert',
+      alertNo: a.alertNo,
+      sensorType: a.sensorType,
+      level: a.level,
+      alertType: a.type,
+      value: a.value,
+      threshold: a.threshold,
+      message: a.message
+    }));
+    
+    const workOrderEvents = workOrders.map(w => ({
+      time: w.createdAt,
+      type: 'workOrder',
+      orderNo: w.orderNo,
+      orderType: w.type,
+      level: w.level,
+      status: w.status,
+      description: w.description
+    }));
+    
+    const allEvents = [...feedingEvents, ...alertEvents, ...workOrderEvents]
+      .sort((a, b) => new Date(a.time) - new Date(b.time));
+    
+    const thresholds = pond.thresholds || {};
+    const thresholdLines = {};
+    if (thresholds.temperatureMin !== undefined || thresholds.temperatureMax !== undefined) {
+      thresholdLines.temperature = {
+        min: thresholds.temperatureMin,
+        max: thresholds.temperatureMax,
+        optimal: pond.fishSpecies?.optimalTemperature?.optimal || null
+      };
+    }
+    if (thresholds.oxygenMin !== undefined) {
+      thresholdLines.oxygen = {
+        min: thresholds.oxygenMin,
+        optimal: pond.fishSpecies?.optimalOxygen?.optimal || null
+      };
+    }
+    if (thresholds.phMin !== undefined || thresholds.phMax !== undefined) {
+      thresholdLines.ph = {
+        min: thresholds.phMin,
+        max: thresholds.phMax,
+        optimal: pond.fishSpecies?.optimalPH?.optimal || null
+      };
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        pondId: id,
+        pondNo: pond.pondNo,
+        pondName: pond.name,
+        date: targetDate,
+        series,
+        events: allEvents,
+        thresholdLines,
+        summary: {
+          sensorDataPoints: sensorData.length,
+          feedingCount: feedingRecords.length,
+          alertCount: alerts.length,
+          workOrderCount: workOrders.length
+        }
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getPondHealthScores = async (req, res, next) => {
+  try {
+    const { sortBy = 'risk', order = 'desc' } = req.query;
+    
+    const ponds = await Pond.find({ status: { $ne: 'maintenance' } })
+      .populate('fishSpecies')
+      .populate('assignedWorker', 'realName');
+    
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    
+    const scores = [];
+    
+    for (const pond of ponds) {
+      const [recentSensorData, recentAlerts, recentFeedings, recentDeviceFaults] = await Promise.all([
+        SensorData.find({
+          pond: pond._id,
+          timestamp: { $gte: sevenDaysAgo }
+        }).sort({ timestamp: 1 }),
+        
+        Alert.find({
+          pond: pond._id,
+          timestamp: { $gte: sevenDaysAgo }
+        }),
+        
+        FeedingRecord.find({
+          pond: pond._id,
+          date: { $gte: sevenDaysAgo }
+        }),
+        
+        Device.find({
+          pond: pond._id,
+          status: 'fault',
+          lastFaultTime: { $gte: sevenDaysAgo }
+        })
+      ]);
+      
+      let stabilityScore = 100;
+      if (recentSensorData.length > 1) {
+        const byType = {};
+        recentSensorData.forEach(d => {
+          if (!byType[d.sensorType]) byType[d.sensorType] = [];
+          byType[d.sensorType].push(d.value);
+        });
+        
+        let totalCV = 0;
+        let typeCount = 0;
+        for (const [type, values] of Object.entries(byType)) {
+          if (values.length < 2) continue;
+          const mean = values.reduce((a, b) => a + b, 0) / values.length;
+          if (mean === 0) continue;
+          const variance = values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / values.length;
+          const cv = Math.sqrt(variance) / Math.abs(mean);
+          totalCV += cv;
+          typeCount++;
+        }
+        
+        if (typeCount > 0) {
+          const avgCV = totalCV / typeCount;
+          stabilityScore = Math.max(0, Math.min(100, 100 - avgCV * 500));
+        }
+      } else {
+        stabilityScore = 50;
+      }
+      
+      let alertScore = 100;
+      recentAlerts.forEach(alert => {
+        switch (alert.level) {
+          case 'low': alertScore -= 3; break;
+          case 'medium': alertScore -= 8; break;
+          case 'high': alertScore -= 15; break;
+          case 'critical': alertScore -= 25; break;
+        }
+      });
+      alertScore = Math.max(0, Math.min(100, alertScore));
+      
+      let feedingScore = 100;
+      const totalFeedings = recentFeedings.length;
+      const completedFeedings = recentFeedings.filter(f => f.status === 'completed').length;
+      const failedFeedings = recentFeedings.filter(f => f.status === 'failed').length;
+      
+      if (totalFeedings > 0) {
+        const completionRate = completedFeedings / totalFeedings;
+        feedingScore = completionRate * 80;
+        
+        const feedingsWithConsumed = recentFeedings.filter(f => f.consumedRatio != null);
+        if (feedingsWithConsumed.length > 0) {
+          const avgConsumed = feedingsWithConsumed.reduce((sum, f) => sum + f.consumedRatio, 0) / feedingsWithConsumed.length;
+          feedingScore += Math.min(20, avgConsumed / 5);
+        }
+        
+        feedingScore -= failedFeedings * 10;
+      } else {
+        feedingScore = 60;
+      }
+      feedingScore = Math.max(0, Math.min(100, feedingScore));
+      
+      let deviceScore = 100;
+      deviceScore -= recentDeviceFaults.length * 20;
+      deviceScore = Math.max(0, Math.min(100, deviceScore));
+      
+      const overallScore = Math.round(
+        stabilityScore * 0.3 + alertScore * 0.25 + feedingScore * 0.25 + deviceScore * 0.2
+      );
+      
+      let riskLevel;
+      if (overallScore >= 80) riskLevel = 'low';
+      else if (overallScore >= 60) riskLevel = 'medium';
+      else if (overallScore >= 40) riskLevel = 'high';
+      else riskLevel = 'critical';
+      
+      scores.push({
+        pondId: pond._id,
+        pondNo: pond.pondNo,
+        pondName: pond.name,
+        status: pond.status,
+        fishSpecies: pond.fishSpecies?.name,
+        assignedWorker: pond.assignedWorker?.realName,
+        currentWaterQuality: pond.currentWaterQuality,
+        overallScore,
+        riskLevel,
+        dimensions: {
+          waterQualityStability: Math.round(stabilityScore),
+          alertScore: Math.round(alertScore),
+          feedingCompletion: Math.round(feedingScore),
+          deviceHealth: Math.round(deviceScore)
+        },
+        details: {
+          recentAlertCount: recentAlerts.length,
+          criticalAlertCount: recentAlerts.filter(a => a.level === 'critical').length,
+          feedingCompletionRate: totalFeedings > 0 ? Math.round(completedFeedings / totalFeedings * 100) : null,
+          feedingFailureCount: failedFeedings,
+          deviceFaultCount: recentDeviceFaults.length
+        }
+      });
+    }
+    
+    if (sortBy === 'risk') {
+      scores.sort((a, b) => order === 'desc' ? a.overallScore - b.overallScore : b.overallScore - a.overallScore);
+    } else if (sortBy === 'score') {
+      scores.sort((a, b) => order === 'desc' ? b.overallScore - a.overallScore : a.overallScore - b.overallScore);
+    }
+    
+    res.json({
+      success: true,
+      data: scores
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   getPonds,
   getPondById,
@@ -230,5 +525,7 @@ module.exports = {
   updatePond,
   deletePond,
   getPondSummary,
-  updatePondThresholds
+  updatePondThresholds,
+  getPondDailyTimeline,
+  getPondHealthScores
 };

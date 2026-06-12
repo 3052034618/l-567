@@ -5,7 +5,9 @@ const {
   createPond,
   updatePond,
   deletePond,
-  getPondSummary
+  getPondSummary,
+  getPondDailyTimeline,
+  getPondHealthScores
 } = require('../controllers/pondController');
 const { authMiddleware, roleMiddleware } = require('../middleware/auth');
 
@@ -14,7 +16,9 @@ const router = express.Router();
 router.use(authMiddleware);
 
 router.get('/summary', getPondSummary);
+router.get('/health-scores', getPondHealthScores);
 router.get('/', getPonds);
+router.get('/:id/timeline', getPondDailyTimeline);
 router.get('/:id', getPondById);
 
 router.use(roleMiddleware('admin', 'supervisor'));

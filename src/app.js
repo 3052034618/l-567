@@ -26,6 +26,7 @@ const feedingRoutes = require('./routes/feedingRoutes');
 const deviceRoutes = require('./routes/deviceRoutes');
 const energyRoutes = require('./routes/energyRoutes');
 const dailyLogRoutes = require('./routes/dailyLogRoutes');
+const feedingScheduleRoutes = require('./routes/feedingScheduleRoutes');
 
 const app = express();
 const server = http.createServer(app);
@@ -80,6 +81,7 @@ app.use('/api/feeding', feedingRoutes);
 app.use('/api/devices', deviceRoutes);
 app.use('/api/energy', energyRoutes);
 app.use('/api/daily-logs', dailyLogRoutes);
+app.use('/api/feeding-schedules', feedingScheduleRoutes);
 
 app.get('/api/health', (req, res) => {
   res.json({

@@ -1,6 +1,7 @@
 const cron = require('node-cron');
 const { generateAllPondsDailyLog } = require('../controllers/dailyLogController');
-const { scheduleFeeding, calculateFeedAmount } = require('../controllers/feedingController');
+const { scheduleFeeding } = require('../controllers/feedingController');
+const { executeScheduledFeedings } = require('../controllers/feedingScheduleController');
 const Pond = require('../models/Pond');
 const { updatePondThresholds } = require('../controllers/pondController');
 
@@ -18,23 +19,30 @@ const initCronJobs = () => {
     timezone: 'Asia/Shanghai'
   });
   
-  const feedingTimes = ['0 8 * * *', '0 12 * * *', '0 18 * * *'];
-  feedingTimes.forEach((schedule, index) => {
-    cron.schedule(schedule, async () => {
-      console.log(`开始执行第${index + 1}次定时投喂...`);
-      try {
-        const ponds = await Pond.find({ status: { $ne: 'maintenance' } });
-        for (const pond of ponds) {
+  cron.schedule('* * * * *', async () => {
+    await executeScheduledFeedings();
+  }, {
+    scheduled: true,
+    timezone: 'Asia/Shanghai'
+  });
+  
+  cron.schedule('0 8 * * *', async () => {
+    console.log('[兼容模式] 08:00 轮次，为没有计划的池补投...');
+    try {
+      const FeedingSchedule = require('../models/FeedingSchedule');
+      const ponds = await Pond.find({ status: { $ne: 'maintenance' } });
+      for (const pond of ponds) {
+        const hasSchedule = await FeedingSchedule.findOne({ pond: pond._id, isActive: true });
+        if (!hasSchedule) {
           await scheduleFeeding(pond._id, Date.now());
         }
-        console.log(`定时投喂完成，共${ponds.length}个养殖池`);
-      } catch (error) {
-        console.error('定时投喂失败:', error);
       }
-    }, {
-      scheduled: true,
-      timezone: 'Asia/Shanghai'
-    });
+    } catch (error) {
+      console.error('兼容模式投喂失败:', error);
+    }
+  }, {
+    scheduled: true,
+    timezone: 'Asia/Shanghai'
   });
   
   cron.schedule('0 0 * * *', async () => {
@@ -55,7 +63,8 @@ const initCronJobs = () => {
   
   console.log('已配置以下定时任务:');
   console.log('- 每日 02:00 生成昨日养殖日志');
-  console.log('- 每日 08:00、12:00、18:00 自动投喂');
+  console.log('- 每分钟检查投喂计划并执行（计划驱动）');
+  console.log('- 每日 08:00 兼容模式：为无计划的池补投');
   console.log('- 每日 00:00 更新养殖池阈值');
 };
 

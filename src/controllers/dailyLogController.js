@@ -229,7 +229,7 @@ const calculateWorkOrderStats = async (pondId, startDate, endDate) => {
     
     const completedCount = orders.filter(o => o.status === config.workOrderStatus.COMPLETED).length;
     const pendingCount = orders.filter(o => 
-      [config.workOrderStatus.PENDING, config.workOrderStatus.ASSIGNED, config.workOrderStatus.IN_PROGRESS].includes(o.status)
+      [config.workOrderStatus.PENDING, config.workOrderStatus.ASSIGNED, config.workOrderStatus.IN_PROGRESS, config.workOrderStatus.PENDING_REVIEW, config.workOrderStatus.RETURNED].includes(o.status)
     ).length;
     
     return {

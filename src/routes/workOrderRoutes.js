@@ -6,6 +6,8 @@ const {
   assignWorkOrder,
   startWorkOrder,
   completeWorkOrder,
+  approveWorkOrder,
+  returnWorkOrder,
   getWorkOrderStatistics,
   getMyWorkOrders,
   uploadWorkOrderPhoto
@@ -30,5 +32,7 @@ router.use(roleMiddleware('admin', 'supervisor'));
 
 router.post('/', createWorkOrder);
 router.put('/:id/assign', assignWorkOrder);
+router.post('/:id/approve', approveWorkOrder);
+router.post('/:id/return', returnWorkOrder);
 
 module.exports = router;

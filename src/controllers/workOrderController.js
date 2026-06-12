@@ -219,7 +219,7 @@ const autoAssignWorkOrder = async (workOrder) => {
     for (const candidate of topCandidates) {
       const pendingOrders = await WorkOrder.countDocuments({
         assignedTo: candidate.tech._id,
-        status: { $in: [config.workOrderStatus.PENDING, config.workOrderStatus.ASSIGNED, config.workOrderStatus.IN_PROGRESS] }
+        status: { $in: [config.workOrderStatus.PENDING, config.workOrderStatus.ASSIGNED, config.workOrderStatus.IN_PROGRESS, config.workOrderStatus.PENDING_REVIEW, config.workOrderStatus.RETURNED] }
       });
       
       const distanceScore = Math.max(0, 100 - candidate.distance * 0.1);
@@ -263,7 +263,7 @@ const findTechnicianWithLeastOrders = async (technicians) => {
   for (const tech of technicians) {
     const count = await WorkOrder.countDocuments({
       assignedTo: tech._id,
-      status: { $in: [config.workOrderStatus.PENDING, config.workOrderStatus.ASSIGNED, config.workOrderStatus.IN_PROGRESS] }
+      status: { $in: [config.workOrderStatus.PENDING, config.workOrderStatus.ASSIGNED, config.workOrderStatus.IN_PROGRESS, config.workOrderStatus.PENDING_REVIEW, config.workOrderStatus.RETURNED] }
     });
     
     if (count < leastOrders) {
@@ -339,28 +339,170 @@ const completeWorkOrder = async (req, res, next) => {
       return res.status(404).json({ message: '工单不存在' });
     }
     
-    if (order.status !== config.workOrderStatus.IN_PROGRESS && 
-        order.status !== config.workOrderStatus.ASSIGNED) {
-      return res.status(400).json({ message: '当前工单状态不可完成' });
+    if (![config.workOrderStatus.IN_PROGRESS, config.workOrderStatus.ASSIGNED, config.workOrderStatus.RETURNED].includes(order.status)) {
+      return res.status(400).json({ message: '当前工单状态不可提交复核' });
     }
     
-    order.status = config.workOrderStatus.COMPLETED;
-    order.completedAt = Date.now();
+    if (req.user.role === 'technician' && order.assignedTo && 
+        order.assignedTo.toString() !== req.user.id) {
+      return res.status(403).json({ message: '无权限操作此工单' });
+    }
+    
+    order.status = config.workOrderStatus.PENDING_REVIEW;
     order.handledBy = req.user.id;
     order.handlingNotes = handlingNotes || order.handlingNotes;
+    order.submittedAt = Date.now();
+    
+    order.reviewHistory.push({
+      action: 'submit',
+      by: req.user.id,
+      at: Date.now(),
+      notes: handlingNotes
+    });
     
     await order.save();
     await order.populate('pond', 'pondNo name');
+    await order.populate('handledBy', 'realName');
     
-    checkForStubbornDefect(order);
-    
-    resolveRelatedAlerts(order);
+    const supervisors = await User.find({ role: 'supervisor', status: 'active' });
+    supervisors.forEach(supervisor => {
+      websocket.emitToUser(supervisor._id.toString(), 'workOrder:pendingReview', {
+        orderId: order._id,
+        orderNo: order.orderNo,
+        pondNo: order.pond?.pondNo,
+        description: order.description,
+        submittedBy: order.handledBy?.realName,
+        submittedAt: order.submittedAt
+      });
+    });
     
     websocket.emitToAll('workOrder:update', order);
     
     res.json({
       success: true,
-      data: order
+      data: order,
+      message: '工单已提交待复核'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const approveWorkOrder = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { reviewNotes } = req.body;
+    
+    const order = await WorkOrder.findById(id);
+    
+    if (!order) {
+      return res.status(404).json({ message: '工单不存在' });
+    }
+    
+    if (order.status !== config.workOrderStatus.PENDING_REVIEW) {
+      return res.status(400).json({ message: '当前工单状态不可复核' });
+    }
+    
+    if (req.user.role !== 'supervisor' && req.user.role !== 'admin') {
+      return res.status(403).json({ message: '只有主管或管理员可以复核工单' });
+    }
+    
+    order.status = config.workOrderStatus.COMPLETED;
+    order.completedAt = Date.now();
+    order.reviewedBy = req.user.id;
+    order.reviewedAt = Date.now();
+    order.reviewNotes = reviewNotes || '';
+    order.closedBy = req.user.id;
+    
+    order.reviewHistory.push({
+      action: 'approve',
+      by: req.user.id,
+      at: Date.now(),
+      notes: reviewNotes
+    });
+    
+    await order.save();
+    await order.populate('pond', 'pondNo name');
+    await order.populate('reviewedBy', 'realName');
+    
+    checkForStubbornDefect(order);
+    resolveRelatedAlerts(order);
+    
+    if (order.assignedTo) {
+      websocket.emitToUser(order.assignedTo.toString(), 'workOrder:approved', {
+        orderId: order._id,
+        orderNo: order.orderNo,
+        reviewedBy: req.user.realName || '主管',
+        reviewNotes
+      });
+    }
+    
+    websocket.emitToAll('workOrder:update', order);
+    
+    res.json({
+      success: true,
+      data: order,
+      message: '工单已复核通过'
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const returnWorkOrder = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { returnReason } = req.body;
+    
+    if (!returnReason) {
+      return res.status(400).json({ message: '退回时必须填写退回原因' });
+    }
+    
+    const order = await WorkOrder.findById(id);
+    
+    if (!order) {
+      return res.status(404).json({ message: '工单不存在' });
+    }
+    
+    if (order.status !== config.workOrderStatus.PENDING_REVIEW) {
+      return res.status(400).json({ message: '当前工单状态不可退回' });
+    }
+    
+    if (req.user.role !== 'supervisor' && req.user.role !== 'admin') {
+      return res.status(403).json({ message: '只有主管或管理员可以退回工单' });
+    }
+    
+    order.status = config.workOrderStatus.RETURNED;
+    order.reviewedBy = req.user.id;
+    order.reviewedAt = Date.now();
+    order.returnReason = returnReason;
+    
+    order.reviewHistory.push({
+      action: 'return',
+      by: req.user.id,
+      at: Date.now(),
+      notes: returnReason
+    });
+    
+    await order.save();
+    await order.populate('pond', 'pondNo name');
+    await order.populate('reviewedBy', 'realName');
+    
+    if (order.assignedTo) {
+      websocket.emitToUser(order.assignedTo.toString(), 'workOrder:returned', {
+        orderId: order._id,
+        orderNo: order.orderNo,
+        returnReason,
+        reviewedBy: req.user.realName || '主管'
+      });
+    }
+    
+    websocket.emitToAll('workOrder:update', order);
+    
+    res.json({
+      success: true,
+      data: order,
+      message: '工单已退回，技术员可继续补充处理'
     });
   } catch (error) {
     next(error);
@@ -521,6 +663,8 @@ const getWorkOrderStatistics = async (req, res, next) => {
       pending: 0,
       assigned: 0,
       in_progress: 0,
+      pending_review: 0,
+      returned: 0,
       completed: 0,
       cancelled: 0,
       low: 0,
@@ -642,6 +786,8 @@ module.exports = {
   autoAssignWorkOrder,
   startWorkOrder,
   completeWorkOrder,
+  approveWorkOrder,
+  returnWorkOrder,
   getWorkOrderStatistics,
   getMyWorkOrders,
   uploadWorkOrderPhoto,

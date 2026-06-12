@@ -61,6 +61,8 @@ const workOrderSchema = new mongoose.Schema({
       config.workOrderStatus.PENDING,
       config.workOrderStatus.ASSIGNED,
       config.workOrderStatus.IN_PROGRESS,
+      config.workOrderStatus.PENDING_REVIEW,
+      config.workOrderStatus.RETURNED,
       config.workOrderStatus.COMPLETED,
       config.workOrderStatus.CANCELLED
     ],
@@ -117,7 +119,33 @@ const workOrderSchema = new mongoose.Schema({
   closedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
-  }
+  },
+  
+  submittedAt: Date,
+  
+  reviewedBy: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  
+  reviewedAt: Date,
+  
+  reviewNotes: String,
+  
+  returnReason: String,
+  
+  reviewHistory: [{
+    action: {
+      type: String,
+      enum: ['submit', 'approve', 'return']
+    },
+    by: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User'
+    },
+    at: Date,
+    notes: String
+  }]
 }, {
   timestamps: true
 });
