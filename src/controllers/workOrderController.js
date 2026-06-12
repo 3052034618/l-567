@@ -298,7 +298,8 @@ const startWorkOrder = async (req, res, next) => {
     }
     
     if (order.status !== config.workOrderStatus.ASSIGNED && 
-        order.status !== config.workOrderStatus.PENDING) {
+        order.status !== config.workOrderStatus.PENDING &&
+        order.status !== config.workOrderStatus.RETURNED) {
       return res.status(400).json({ message: '当前工单状态不可开始处理' });
     }
     
@@ -308,7 +309,7 @@ const startWorkOrder = async (req, res, next) => {
     }
     
     order.status = config.workOrderStatus.IN_PROGRESS;
-    order.startedAt = Date.now();
+    order.startedAt = order.startedAt || Date.now();
     if (!order.assignedTo) {
       order.assignedTo = req.user.id;
       order.assignedAt = Date.now();
@@ -316,6 +317,7 @@ const startWorkOrder = async (req, res, next) => {
     
     await order.save();
     await order.populate('pond', 'pondNo name');
+    await order.populate('assignedTo', 'realName phone role');
     
     websocket.emitToAll('workOrder:update', order);
     
@@ -361,7 +363,8 @@ const completeWorkOrder = async (req, res, next) => {
     });
     
     await order.save();
-    await order.populate('pond', 'pondNo name');
+    await order.populate('pond', 'pondNo name location');
+    await order.populate('assignedTo', 'realName phone role');
     await order.populate('handledBy', 'realName');
     
     const supervisors = await User.find({ role: 'supervisor', status: 'active' });
@@ -422,7 +425,9 @@ const approveWorkOrder = async (req, res, next) => {
     });
     
     await order.save();
-    await order.populate('pond', 'pondNo name');
+    await order.populate('pond', 'pondNo name location');
+    await order.populate('assignedTo', 'realName phone role');
+    await order.populate('handledBy', 'realName');
     await order.populate('reviewedBy', 'realName');
     
     checkForStubbornDefect(order);
@@ -485,7 +490,9 @@ const returnWorkOrder = async (req, res, next) => {
     });
     
     await order.save();
-    await order.populate('pond', 'pondNo name');
+    await order.populate('pond', 'pondNo name location');
+    await order.populate('assignedTo', 'realName phone role');
+    await order.populate('handledBy', 'realName');
     await order.populate('reviewedBy', 'realName');
     
     if (order.assignedTo) {
@@ -755,23 +762,38 @@ const uploadWorkOrderPhoto = async (req, res, next) => {
     });
     
     await order.save();
-    await order.populate('uploadedBy', 'realName');
+    
+    const updatedOrder = await WorkOrder.findById(order._id)
+      .populate('pond', 'pondNo name location')
+      .populate('assignedTo', 'realName phone role')
+      .populate('handledBy', 'realName')
+      .populate('device', 'name type status');
     
     websocket.emitToAll('workOrder:photo', {
       orderId: order._id,
-      photo: order.photos[order.photos.length - 1]
+      orderNo: order.orderNo,
+      photo: {
+        url: photoUrl,
+        uploadedAt: Date.now(),
+        uploadedBy: req.user.id
+      }
     });
     
-    const isStubborn = await checkForStubbornDefect(order, true);
+    checkForStubbornDefect(order, true).catch(err => {
+      console.error('照片上传后检查顽固缺陷失败:', err);
+    });
     
     res.json({
       success: true,
       data: {
         url: photoUrl,
         uploadedAt: Date.now(),
-        isStubbornDefect: isStubborn,
-        stubbornDefectNotified: isStubborn
-      }
+        orderId: order._id,
+        orderNo: order.orderNo,
+        orderStatus: order.status,
+        photosCount: order.photos.length
+      },
+      order: updatedOrder
     });
   } catch (error) {
     next(error);
